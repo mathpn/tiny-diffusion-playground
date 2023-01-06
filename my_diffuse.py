@@ -13,9 +13,10 @@ from torchvision.utils import save_image, make_grid
 from tqdm import tqdm
 
 
-class DownConv(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int):
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()
+        self.same_channels = in_channels == out_channels
         self.conv1 = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 3, 1, 1),
             nn.BatchNorm2d(out_channels),
@@ -26,31 +27,34 @@ class DownConv(nn.Module):
             nn.BatchNorm2d(out_channels),
             nn.LeakyReLU(),
         )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1 = self.conv1(x)
+        out = self.conv2(x1)
+        if self.same_channels:
+            out = out + x
+        else:
+            out = out + x1
+        return out
+
+
+class DownConv(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.conv = ResidualBlock(in_channels, out_channels)
         self.downsample = nn.MaxPool2d(2)
 
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.downsample(x)
-        return x
+        x = self.conv(x)
+        return self.downsample(x)
 
 
 class UpConv(nn.Module):
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
-        self.conv1 = nn.Sequential(
-            nn.ConvTranspose2d(in_channels, out_channels, 2, 2),
-            nn.BatchNorm2d(out_channels),
-            nn.LeakyReLU(),
-        )
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, 3, 1, 1),
-            nn.BatchNorm2d(out_channels),
-            nn.LeakyReLU(),
-        )
-        self.conv3 = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, 3, 1, 1),
-        )
+        self.conv1 = nn.ConvTranspose2d(in_channels, out_channels, 2, 2)
+        self.conv2 = ResidualBlock(out_channels, out_channels)
+        self.conv3 = ResidualBlock(out_channels, out_channels)
 
     def forward(self, x, skip):
         x = torch.cat((x, skip), dim=1)
@@ -64,16 +68,12 @@ class UNet(nn.Module):
     # https://arxiv.org/abs/2006.11239
     def __init__(self, in_channels: int, out_channels: int, n_feat: int):
         super().__init__()
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(in_channels, n_feat, 3, 1, 1),
-            nn.BatchNorm2d(n_feat),
-            nn.LeakyReLU(),
-        )
+        self.conv1 = ResidualBlock(in_channels, n_feat)
         self.down1 = DownConv(n_feat, n_feat)
         self.down2 = DownConv(n_feat, 2 * n_feat)
         # self.down3 = DownConv(2 * n_feat, 2 * n_feat)
 
-        self.to_vec = nn.Sequential(nn.AvgPool2d(7), nn.ReLU())
+        self.to_vec = nn.Sequential(nn.AvgPool2d(7), nn.LeakyReLU())
 
         self.up0 = nn.Sequential(
             nn.ConvTranspose2d(2 * n_feat, 2 * n_feat, 7, 7),
@@ -180,17 +180,18 @@ def ddpm_schedules(beta1: float, beta2: float, T: int) -> dict[str, torch.Tensor
 def train_mnist():
     os.makedirs("./contents", exist_ok=True)
 
-    n_epochs = 20
+    n_epochs = 40
     betas = (1e-4, 0.02)
     n_T = 1000
+    n_feat = 128
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
-    unet = UNet(1, 1, 32)
+    unet = UNet(1, 1, n_feat)
     ddpm = DDPM(unet, betas, n_T)
     ddpm.to(device)
 
     print(sum(p.numel() for p in ddpm.parameters()))
-    transform = T.Compose([T.ToTensor(), T.Normalize((0.5,), (1.0,))])
+    transform = T.Compose([T.ToTensor()])
     dataset = MNIST("./data", train=True, download=True, transform=transform)
     loader = DataLoader(dataset, batch_size=256, shuffle=True, num_workers=10)
     optim = torch.optim.Adam(ddpm.parameters(), lr=2e-4)
