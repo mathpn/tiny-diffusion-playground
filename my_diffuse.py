@@ -56,8 +56,9 @@ class UpConv(nn.Module):
         self.conv2 = ResidualBlock(out_channels, out_channels)
         self.conv3 = ResidualBlock(out_channels, out_channels)
 
-    def forward(self, x, skip):
-        x = torch.cat((x, skip), dim=1)
+    def forward(self, x, skip=None):
+        if skip is not None:
+            x = torch.cat((x, skip), dim=1)
         x = self.conv1(x)
         x = self.conv2(x)
         x = self.conv3(x)
@@ -92,17 +93,17 @@ class UNet(nn.Module):
         # d3 = self.down3(d2)
 
         # thro = self.to_vec(d3)
-        thro = self.to_vec(d2)
+        z = self.to_vec(d2)
         # TODO time embedding
 
-        thro = self.up0(thro)
+        thro = self.up0(z)
         # up1 = self.up1(thro, d3)
         # up2 = self.up2(up1, d2)
         up2 = self.up2(thro, d2)
         up3 = self.up3(up2, d1)
 
         out = self.out(torch.cat((up3, x), 1))
-        return out
+        return out, z
 
 
 class DDPM(nn.Module):
@@ -127,10 +128,12 @@ class DDPM(nn.Module):
 
         x_t = (
             self.sqrtab[ts, None, None, None] * x + self.sqrtmab[ts, None, None, None] * eps
+            # self.sqrtab[ts, None] * x + self.sqrtmab[ts, None] * eps
         )  # This is the x_t, which is sqrt(alphabar) x_0 + sqrt(1-alphabar) * eps
         # We should predict the "error term" from this x_t. Loss is what we return.
 
-        return self.criterion(eps, self.eps_model(x_t, ts / self.n_T))
+        eps_h, z = self.eps_model(x_t, ts / self.n_T)
+        return self.criterion(eps, eps_h), z
 
     def sample(self, n_sample: int, size, device) -> torch.Tensor:
 
@@ -139,7 +142,7 @@ class DDPM(nn.Module):
         # This samples accordingly to Algorithm 2. It is exactly the same logic.
         for i in range(self.n_T, 0, -1):
             z = torch.randn(n_sample, *size).to(device) if i > 1 else 0
-            eps = self.eps_model(x_i, torch.tensor(i / self.n_T).to(device).repeat(n_sample, 1))
+            eps, _ = self.eps_model(x_i, torch.tensor(i / self.n_T).to(device).repeat(n_sample, 1))
             x_i = (
                 self.oneover_sqrta[i] * (x_i - eps * self.mab_over_sqrtmab[i])
                 + self.sqrt_beta_t[i] * z
@@ -177,12 +180,19 @@ def ddpm_schedules(beta1: float, beta2: float, T: int) -> dict[str, torch.Tensor
     }
 
 
+def kl_div(z):
+    var = z.var()
+    logvar = var.log()
+    mu = z.mean()
+    return 0.5 * torch.mean(torch.pow(mu, 2) + var - 1.0 - logvar)
+
+
 def train_mnist():
     os.makedirs("./contents", exist_ok=True)
 
     n_epochs = 40
     betas = (1e-4, 0.02)
-    n_T = 1000
+    n_T = 500
     n_feat = 128
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
@@ -201,16 +211,21 @@ def train_mnist():
 
         pbar = tqdm(loader)
         loss_ema = None
+        kl_ema = None
         for x, _ in pbar:
             optim.zero_grad()
             x = x.to(device)
-            loss = ddpm(x)
+            loss, z = ddpm(x)
+            loss_kl = kl_div(z)
+            loss = loss + 0.05 * loss_kl
             loss.backward()
             if loss_ema is None:
                 loss_ema = loss.item()
+                kl_ema = loss_kl.item()
             else:
                 loss_ema = 0.9 * loss_ema + 0.1 * loss.item()
-            pbar.set_description(f"loss: {loss_ema:.4f}")
+                kl_ema = 0.9 * kl_ema + 0.1 * loss_kl.item()
+            pbar.set_description(f"loss: {loss_ema:.4f} KL: {kl_ema:.2f}")
             optim.step()
 
         ddpm.eval()
