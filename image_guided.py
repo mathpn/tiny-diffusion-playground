@@ -19,7 +19,7 @@ from einops import rearrange, reduce, repeat
 from PIL import Image
 from torch import einsum, nn
 from torch.utils.data import Dataset
-from torchvision.datasets import StanfordCars
+from torchvision.datasets import STL10
 from torchvision.models import VGG16_Weights, vgg16
 from torchvision.utils import make_grid, save_image
 from tqdm.auto import tqdm
@@ -1020,19 +1020,27 @@ class FlowerDataset(Dataset):
         return img, reduced_img, label
 
 
-def pair_transform(img, size: int = 32):
+def pair_transform(img, size: int = 64):
     img = T.functional.to_tensor(img)
-    img = T.functional.resize(img, 224)
-    img = T.functional.center_crop(img, 224)
+    large_img = T.functional.resize(img, 224)
+    large_img = T.functional.center_crop(large_img, 224)
     small_img = T.functional.resize(img, (size, size))
-    img = T.functional.normalize(img, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    return (img, small_img)
+    small_img = T.functional.center_crop(small_img, size)
+    large_img = T.functional.normalize(
+        large_img, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+    )
+    return (large_img, small_img)
 
+
+def slerp(val, low, high):
+    omega = torch.arccos(torch.dot(low / torch.norm(low), high / torch.norm(high)))
+    so = torch.sin(omega)
+    return torch.sin((1.0 - val) * omega) / so * low + torch.sin(val * omega) / so * high
 
 
 model = Unet(
     dim=64,
-    dim_mults=(1, 2, 4),
+    dim_mults=(1, 2, 4, 8),
     class_emb_dim=768,
     num_classes=102,
     channels=3,
@@ -1041,7 +1049,7 @@ model = Unet(
 
 diffusion = GaussianDiffusion(
     model,
-    image_size=32,
+    image_size=64,
     timesteps=1000,  # number of steps
     sampling_timesteps=250,  # number of sampling timesteps (using ddim for faster inference [see citation for ddim paper])
 ).cuda()
@@ -1054,40 +1062,40 @@ print(sum(p.numel() for p in diffusion.parameters()))
 
 from torchvision import transforms as T
 
-transform = T.Compose([T.Resize((224, 224)), T.ToTensor(), T.RandomHorizontalFlip()])
 unnormalize = T.Normalize(
     mean=[-0.485 / 0.229, -0.456 / 0.224, -0.406 / 0.225], std=[1 / 0.229, 1 / 0.224, 1 / 0.225]
 )
-# dataset = MNIST("./data", train=True, download=True, transform=transform)
 
 from torch.utils.data import DataLoader
 
-dataset = StanfordCars("./data", download=True, transform=pair_transform)
+dataset = STL10("./data", download=True, split="train+unlabeled", transform=pair_transform)
 loader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=cpu_count())
-optim = torch.optim.Adam(diffusion.parameters(), lr=2e-4)
+optim = torch.optim.Adam(diffusion.parameters(), lr=8e-5)
 
-
-samples = random.sample(range(len(dataset)), k=20)
-samples = [dataset[idx][0][0] for idx in samples]
-img_samples = torch.stack(samples).cuda()
 
 vit = timm.create_model("deit_base_patch16_224", pretrained=True)
 vit = vit.cuda().eval()
 vit.head = nn.Identity()
 
-with torch.no_grad():
-    samples_z = vit(img_samples)
-    merged_z = (samples_z[:10] + samples_z[10:]) / 2
-
-img_samples = unnormalize(T.functional.resize(img_samples, 32))
-
 
 for epoch in range(n_epochs):
+
+    samples = random.sample(range(len(dataset)), k=40)
+    samples = [dataset[idx][0][0] for idx in samples]
+    img_samples = torch.stack(samples).cuda()
+
+    with torch.no_grad():
+        samples_z = vit(img_samples)
+        samples_z = F.normalize(samples_z)
+        merged_z = torch.stack([slerp(0.5, samples_z[i], samples_z[20 + i]) for i in range(20)])
+
+    img_samples = unnormalize(T.functional.resize(img_samples, 64))
+
     diffusion.train()
 
     pbar = tqdm(loader)
     loss_ema = None
-    for (x, small_x), _ in pbar:
+    for i, ((x, small_x), _) in enumerate(pbar):
         optim.zero_grad()
         x = x.cuda()
         small_x = small_x.cuda()
@@ -1104,13 +1112,13 @@ for epoch in range(n_epochs):
 
     diffusion.eval()
     with torch.no_grad():
-        sample = diffusion.sample(samples_z[:10], cond_scale=5)
-        grid = make_grid(torch.cat((sample, img_samples[:10]), dim=0), nrow=10)
-        save_image(grid, f"./contents/guidance_cars_{epoch}.png")
+        sample = diffusion.sample(samples_z[:20], cond_scale=5)
+        grid = make_grid(torch.cat((sample, img_samples[:20]), dim=0), nrow=20)
+        save_image(grid, f"./contents/guidance_{epoch}.png")
 
         sample = diffusion.sample(merged_z, cond_scale=5)
-        grid = make_grid(torch.cat((sample, img_samples), dim=0), nrow=10)
-        save_image(grid, f"./contents/merged_cars_{epoch}.png")
+        grid = make_grid(torch.cat((sample, img_samples), dim=0), nrow=20)
+        save_image(grid, f"./contents/merged_{epoch}.png")
 
         # save model
-        torch.save(diffusion.state_dict(), f"./guided_diffusion_cars.pth")
+        torch.save(diffusion.state_dict(), f"./guided_diffusion.pth")
