@@ -546,9 +546,11 @@ class GaussianDiffusion(nn.Module):
     def __init__(
         self,
         model,
+        ema_model,
         *,
         image_size,
         timesteps=1000,
+        decay: float = 0.99,
         sampling_timesteps=None,
         loss_type="l1",
         objective="pred_noise",
@@ -562,7 +564,12 @@ class GaussianDiffusion(nn.Module):
         assert not model.random_or_learned_sinusoidal_cond
 
         self.model = model
+        self.ema_model = ema_model
+        for param in self.ema_model.parameters():
+            param.requires_grad_(False)
+
         self.channels = self.model.channels
+        self.decay = decay
 
         self.image_size = image_size
 
@@ -675,8 +682,9 @@ class GaussianDiffusion(nn.Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
+    @torch.no_grad()
     def model_predictions(self, x, t, classes, cond_scale=3.0, clip_x_start=False):
-        model_output = self.model.forward_with_cond_scale(x, t, classes, cond_scale=cond_scale)
+        model_output = self.ema_model.forward_with_cond_scale(x, t, classes, cond_scale=cond_scale)
         maybe_clip = partial(torch.clamp, min=-1.0, max=1.0) if clip_x_start else identity
 
         if self.objective == "pred_noise":
@@ -827,7 +835,13 @@ class GaussianDiffusion(nn.Module):
         else:
             raise ValueError(f"invalid loss type {self.loss_type}")
 
+    def _update_ema_model(self):
+        for param, ema_param in zip(self.model.parameters(), self.ema_model.parameters()):
+            ema_param.data = self.decay * ema_param.data + (1 - self.decay) * param
+
     def p_losses(self, x_start, t, *, classes, noise=None):
+        self._update_ema_model()
+
         b, c, h, w = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
@@ -1000,7 +1014,6 @@ class FlowerDataset(Dataset):
             - 1
         )
         self._map_images()
-        self.normalize = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
     def _map_images(self):
         files = sorted(os.listdir(f"{self.data_path}/jpg"))
@@ -1014,10 +1027,7 @@ class FlowerDataset(Dataset):
     def __getitem__(self, idx):
         img_name, label = self.imgs[idx]
         img = Image.open(f"{self.data_path}/jpg/{img_name}")
-        img = self.transform(img)
-        reduced_img = T.functional.resize(img, self.reduced_size)
-        img = self.normalize(img)
-        return img, reduced_img, label
+        return self.transform(img), label
 
 
 def pair_transform(img, size: int = 64):
@@ -1044,14 +1054,25 @@ model = Unet(
     class_emb_dim=768,
     num_classes=102,
     channels=3,
-    cond_drop_prob=0.2,
+    cond_drop_prob=0.5,
+).cuda()
+
+ema_model = Unet(
+    dim=64,
+    dim_mults=(1, 2, 4, 8),
+    class_emb_dim=768,
+    num_classes=102,
+    channels=3,
+    cond_drop_prob=0.5,
 ).cuda()
 
 diffusion = GaussianDiffusion(
     model,
+    ema_model,
     image_size=64,
     timesteps=1000,  # number of steps
-    sampling_timesteps=250,  # number of sampling timesteps (using ddim for faster inference [see citation for ddim paper])
+    sampling_timesteps=500,  # number of sampling timesteps (using ddim for faster inference [see citation for ddim paper])
+    loss_type="l1",
 ).cuda()
 
 os.makedirs("./contents", exist_ok=True)
@@ -1069,6 +1090,7 @@ unnormalize = T.Normalize(
 from torch.utils.data import DataLoader
 
 dataset = STL10("./data", download=True, split="train+unlabeled", transform=pair_transform)
+# dataset = FlowerDataset("./data/flowers-102", pair_transform)
 loader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=cpu_count())
 optim = torch.optim.Adam(diffusion.parameters(), lr=8e-5)
 
@@ -1101,6 +1123,7 @@ for epoch in range(n_epochs):
         small_x = small_x.cuda()
         with torch.no_grad():
             img_emb = vit(x)
+            img_emb = F.normalize(img_emb)
         loss = diffusion(small_x, classes=img_emb)
         loss.backward()
         if loss_ema is None:
